@@ -57,6 +57,8 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  batches: ReviewBatch[];
+  activeBatchId: string | null;
   updatedAt: string;
 }
 
@@ -68,6 +70,38 @@ interface AccessibilityIssue {
   title: string;
   detail: string;
   suggestion: string;
+}
+
+interface BatchIssue {
+  id: string;
+  blockId: string;
+  severity: Severity;
+  title: string;
+  detail: string;
+  blockRef: string;
+  blockPreview: string;
+}
+
+interface BatchReport {
+  resolved: BatchIssue[];
+  added: BatchIssue[];
+  withdrawn: BatchIssue[];
+  remaining: BatchIssue[];
+  note: string;
+}
+
+type BatchDelta = Omit<BatchReport, "note">;
+
+interface ReviewBatch {
+  id: string;
+  label: string;
+  status: "open" | "closed";
+  startedAt: string;
+  closedAt?: string;
+  baselineVersionId: string;
+  baselineBlocks: ContentBlock[];
+  baselineIssues: BatchIssue[];
+  report?: BatchReport;
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
@@ -167,6 +201,8 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    batches: [],
+    activeBatchId: null,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -299,6 +335,58 @@ function analyze(project: ChapterProject): AccessibilityIssue[] {
   return issues;
 }
 
+const fmtTime = (iso: string) => new Date(iso).toLocaleString();
+
+// 复核批次期间，只有改到这三类内容才会让内容块回到待复核：
+// 标题层级、图片说明（替代文本）、链接文案。
+function trackedSignature(block: ContentBlock) {
+  if (block.type === "heading") return `heading:${block.headingLevel ?? 2}`;
+  if (block.type === "image") return `image:${block.imageAlt ?? block.accessibleText}`;
+  if (block.type === "link") return `link:${block.accessibleText}`;
+  return "";
+}
+
+function applyBatchRecheck(block: ContentBlock, draft: ChapterProject) {
+  const batch = draft.batches.find((item) => item.id === draft.activeBatchId && item.status === "open");
+  if (!batch) {
+    block.reviewStatus = "pending";
+    return;
+  }
+  const baseline = batch.baselineBlocks.find((item) => item.id === block.id);
+  if (!baseline || trackedSignature(block) !== trackedSignature(baseline)) block.reviewStatus = "pending";
+}
+
+function toBatchIssue(issue: AccessibilityIssue, blocks: ContentBlock[]): BatchIssue {
+  const index = blocks.findIndex((block) => block.id === issue.blockId);
+  const block = index >= 0 ? blocks[index] : undefined;
+  return {
+    id: issue.id,
+    blockId: issue.blockId,
+    severity: issue.severity,
+    title: issue.title,
+    detail: issue.detail,
+    blockRef: block ? `段 ${index + 1} · ${blockRole(block)}` : "已移除的内容块",
+    blockPreview: block ? (block.accessibleText || block.text).slice(0, 40) : "",
+  };
+}
+
+function computeBatchReport(batch: ReviewBatch, state: ChapterProject): BatchDelta {
+  const currentIssues = analyze(state);
+  const currentIds = new Set(currentIssues.map((issue) => issue.id));
+  const baselineIds = new Set(batch.baselineIssues.map((issue) => issue.id));
+  const blockIds = new Set(state.blocks.map((block) => block.id));
+  return {
+    // 块仍在且该问题消失：问题已被解决
+    resolved: batch.baselineIssues.filter((issue) => !currentIds.has(issue.id) && blockIds.has(issue.blockId)),
+    // 块已被移除/替换：问题随内容撤回
+    withdrawn: batch.baselineIssues.filter((issue) => !blockIds.has(issue.blockId)),
+    // 基线中存在、当前仍存在：遗留未处理
+    remaining: batch.baselineIssues.filter((issue) => currentIds.has(issue.id)),
+    // 基线没有、当前新出现
+    added: currentIssues.filter((issue) => !baselineIds.has(issue.id)).map((issue) => toBatchIssue(issue, state.blocks)),
+  };
+}
+
 function simplifyText(input: string, glossary: GlossaryTerm[]) {
   let result = input
     .replaceAll("由于其", "因为")
@@ -391,7 +479,14 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) {
+      const loaded = stored.project;
+      loaded.versions = loaded.versions ?? [];
+      loaded.glossary = loaded.glossary ?? [];
+      loaded.batches = loaded.batches ?? [];
+      loaded.activeBatchId = loaded.activeBatchId ?? null;
+      return loaded;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -411,6 +506,11 @@ let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
+let showBatchCenter = false;
+let showCloseBatch = false;
+let closeNoteError = false;
+let viewBatchId = "";
+let showExportBlocked = false;
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
@@ -466,6 +566,11 @@ function render() {
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const currentBatch = project.batches.find((item) => item.id === project.activeBatchId && item.status === "open");
+  const batchLive = currentBatch ? computeBatchReport(currentBatch, project) : null;
+  const pendingBlocks = project.blocks.filter((block) => block.reviewStatus === "pending").length;
+  const errorIssues = list.filter((issue) => issue.severity === "error");
+  const viewedBatch = project.batches.find((item) => item.id === viewBatchId && item.status === "closed");
 
   app.innerHTML = `
     <div class="app-shell">
@@ -480,8 +585,9 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="${currentBatch ? "primary" : "default"}" data-action="batch-center">${currentBatch ? "复核中…" : "复核批次"}</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
-          <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
+          <sl-button size="small" variant="${errorIssues.length ? "warning" : "success"}" data-action="export">${errorIssues.length ? `导出（${errorIssues.length} 个必须修复）` : "导出无障碍 HTML"}</sl-button>
         </div>
       </header>
 
@@ -494,6 +600,17 @@ function render() {
           <span class="info">${list.filter((issue) => issue.severity === "info").length} 术语提醒</span>
         </div>
       </div>
+
+      ${currentBatch && batchLive ? `<div class="batch-strip">
+        <span class="batch-dot" aria-hidden="true"></span>
+        <b>${escapeHtml(currentBatch.label)} · 进行中</b>
+        <span>基线 ${currentBatch.baselineIssues.length} 问题</span>
+        <span class="ok">已解决 ${batchLive.resolved.length}</span>
+        <span class="bad">新增 ${batchLive.added.length}</span>
+        <span>撤回 ${batchLive.withdrawn.length}</span>
+        <span>待复核 ${pendingBlocks} 块</span>
+        <sl-button size="small" variant="primary" outline data-action="close-batch">关闭批次</sl-button>
+      </div>` : ""}
 
       <div class="workspace">
         <aside class="outline-panel">
@@ -598,7 +715,12 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
-    </sl-dialog>`;
+    </sl-dialog>
+
+    ${renderBatchCenterDialog(currentBatch, batchLive, pendingBlocks)}
+    ${renderCloseBatchDialog(currentBatch, batchLive)}
+    ${renderBatchReportDialog(viewedBatch)}
+    ${renderExportBlockedDialog(errorIssues)}`;
 
   wireLiveFields();
 }
@@ -648,11 +770,111 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
 
+function renderBatchIssueSection(title: string, items: BatchIssue[], tone: string) {
+  return `<section class="report-section ${tone}">
+    <h3><span>${title}</span><sl-badge>${items.length}</sl-badge></h3>
+    ${items.length ? `<ul>${items.map((issue) => `<li>
+      <sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge>
+      <div><b>${escapeHtml(issue.title)}</b><small>${escapeHtml(issue.blockRef)}${issue.blockPreview ? ` · ${escapeHtml(issue.blockPreview)}` : ""}</small><span>${escapeHtml(issue.detail)}</span></div>
+    </li>`).join("")}</ul>` : `<div class="empty-note">无</div>`}
+  </section>`;
+}
+
+function renderBatchRow(batch: ReviewBatch) {
+  const report = batch.report;
+  return `<div class="batch-row">
+    <div class="batch-row-main">
+      <b>${escapeHtml(batch.label)}</b>
+      <sl-badge variant="${batch.status === "open" ? "success" : "neutral"}">${batch.status === "open" ? "进行中" : "已关闭"}</sl-badge>
+      <small>${fmtTime(batch.startedAt)}${batch.closedAt ? ` → ${fmtTime(batch.closedAt)}` : ""}</small>
+    </div>
+    <div class="batch-row-stats">基线 ${batch.baselineIssues.length} 问题 · ${batch.baselineBlocks.length} 块${report ? ` · 已解决 ${report.resolved.length} · 新增 ${report.added.length} · 撤回 ${report.withdrawn.length}` : ""}</div>
+    ${report ? `<sl-button size="small" outline data-action="view-batch" data-batch-id="${batch.id}">查看报告</sl-button>` : ""}
+  </div>`;
+}
+
+function renderBatchCenterDialog(currentBatch: ReviewBatch | undefined, live: BatchDelta | null, pendingBlocks: number) {
+  if (!showBatchCenter) return "";
+  const baselineVersion = currentBatch ? project.versions.find((item) => item.id === currentBatch.baselineVersionId) : undefined;
+  return `<sl-dialog label="发布复核批次" open data-dialog="batch-center">
+    ${currentBatch && live ? `
+      <div class="batch-active-card">
+        <div class="batch-card-head"><sl-badge variant="success">进行中</sl-badge><b>${escapeHtml(currentBatch.label)}</b><time>开始于 ${fmtTime(currentBatch.startedAt)}</time></div>
+        <div class="batch-baseline">基线：${currentBatch.baselineIssues.length} 个问题 · ${currentBatch.baselineBlocks.length} 个内容块 · 版本「${baselineVersion ? escapeHtml(baselineVersion.label) : "已被清理"}」</div>
+        <div class="batch-stats"><span class="ok">已解决 ${live.resolved.length}</span><span class="bad">新增 ${live.added.length}</span><span>撤回 ${live.withdrawn.length}</span><span>待复核 ${pendingBlocks} 块</span></div>
+        <div><sl-button size="small" variant="primary" data-action="close-batch">关闭批次并生成报告</sl-button></div>
+      </div>` : `
+      <div class="batch-intro">
+        <p>开始批次时，系统会记录当前问题清单、全部内容块和一个版本快照作为基线。批次期间，只有实际改到<b>标题层级、图片说明或链接文案</b>的内容块才会回到待复核；关闭时对照基线列出已解决、新增和撤回的问题，并需填写处理说明。</p>
+        <sl-button size="small" variant="primary" data-action="start-batch">开始复核批次</sl-button>
+      </div>`}
+    <h3 class="batch-history-title">批次历史</h3>
+    <div class="batch-history">
+      ${project.batches.length ? project.batches.map((batch) => renderBatchRow(batch)).join("") : `<div class="empty-note">还没有复核批次。</div>`}
+    </div>
+    <sl-button slot="footer" variant="primary" data-action="close-batch-center">完成</sl-button>
+  </sl-dialog>`;
+}
+
+function renderCloseBatchDialog(batch: ReviewBatch | undefined, live: BatchDelta | null) {
+  if (!showCloseBatch || !batch || !live) return "";
+  return `<sl-dialog label="关闭 ${escapeHtml(batch.label)}" open data-dialog="close-batch">
+    <p class="dialog-lead">对照开始时的基线，本轮处理结果如下。请写清处理说明后再关闭批次。</p>
+    ${renderBatchIssueSection("已解决", live.resolved, "ok")}
+    ${renderBatchIssueSection("新增", live.added, "bad")}
+    ${renderBatchIssueSection("撤回（内容块已移除）", live.withdrawn, "muted")}
+    ${renderBatchIssueSection("遗留未处理", live.remaining, "left")}
+    <sl-textarea id="close-note" rows="3" label="处理说明（必填）" placeholder="例如：已补齐图片替代文本并改写链接文案；遗留的长句问题转入下一批次处理。"></sl-textarea>
+    ${closeNoteError ? `<div class="note-error">请填写处理说明后再关闭批次。</div>` : ""}
+    <sl-button slot="footer" variant="default" data-action="cancel-close-batch">取消</sl-button>
+    <sl-button slot="footer" variant="primary" data-action="confirm-close-batch">确认关闭批次</sl-button>
+  </sl-dialog>`;
+}
+
+function renderBatchReportDialog(batch: ReviewBatch | undefined) {
+  if (!batch?.report) return "";
+  const report = batch.report;
+  const baselineVersion = project.versions.find((item) => item.id === batch.baselineVersionId);
+  return `<sl-dialog label="${escapeHtml(batch.label)} · 复核报告" open data-dialog="batch-report">
+    <div class="report-meta">
+      <span>开始 ${fmtTime(batch.startedAt)}</span>
+      <span>关闭 ${batch.closedAt ? fmtTime(batch.closedAt) : "—"}</span>
+      <span>基线版本：${baselineVersion ? escapeHtml(baselineVersion.label) : "已被清理"}</span>
+      <span>基线：${batch.baselineIssues.length} 问题 · ${batch.baselineBlocks.length} 块</span>
+    </div>
+    <div class="report-note"><b>处理说明</b><p>${escapeHtml(report.note)}</p></div>
+    ${renderBatchIssueSection("已解决", report.resolved, "ok")}
+    ${renderBatchIssueSection("新增", report.added, "bad")}
+    ${renderBatchIssueSection("撤回（内容块已移除）", report.withdrawn, "muted")}
+    ${renderBatchIssueSection("关闭时仍遗留", report.remaining, "left")}
+    <sl-button slot="footer" variant="primary" data-action="close-batch-report">关闭</sl-button>
+  </sl-dialog>`;
+}
+
+function renderExportBlockedDialog(errorIssues: AccessibilityIssue[]) {
+  if (!showExportBlocked) return "";
+  return `<sl-dialog label="导出已被拦截" open data-dialog="export-blocked">
+    <p class="dialog-lead">仍有 <b>${errorIssues.length}</b> 个必须修复的问题。为避免导出带病版本，本次导出已被拦截，请处理以下内容块后重试：</p>
+    <div class="blocked-list">
+      ${errorIssues.map((issue) => {
+        const index = project.blocks.findIndex((block) => block.id === issue.blockId);
+        const block = index >= 0 ? project.blocks[index] : undefined;
+        return `<button data-action="jump-block" data-block-id="${issue.blockId}">
+          <sl-badge variant="danger">${severityLabel(issue.severity)}</sl-badge>
+          <b>${escapeHtml(issue.title)}</b>
+          <small>段 ${index + 1} · ${block ? blockRole(block) : "未知内容块"} · ${escapeHtml((block?.accessibleText || block?.text || "").slice(0, 36))}</small>
+        </button>`;
+      }).join("")}
+    </div>
+    <sl-button slot="footer" variant="primary" data-action="close-export-blocked">返回修改</sl-button>
+  </sl-dialog>`;
+}
+
 function wireLiveFields() {
   app.querySelectorAll<HTMLElement>("sl-input[data-field], sl-textarea[data-field], sl-select[data-field]").forEach((element) => {
     element.addEventListener("sl-input", () => {
       const value = (element as HTMLElement & { value: string }).value;
-      updateActiveBlock((block) => {
+      updateActiveBlock((block, draft) => {
         const field = element.dataset.field;
         if (field === "source") block.text = value;
         if (field === "accessible") {
@@ -665,7 +887,7 @@ function wireLiveFields() {
         }
         if (field === "link-href") block.linkHref = value;
         if (field === "reason") block.changeReason = value;
-        block.reviewStatus = "pending";
+        applyBatchRecheck(block, draft);
       }, "编辑无障碍文本", false);
     });
     element.addEventListener("sl-change", () => render());
@@ -694,11 +916,11 @@ app.addEventListener("click", (event) => {
     const suggestion = block.type === "link"
       ? "打开水循环互动实验"
       : simplifyText(block.type === "image" ? block.imageAlt || block.text : block.text, project.glossary);
-    updateActiveBlock((current) => {
+    updateActiveBlock((current, draft) => {
       if (current.type === "image") current.imageAlt = suggestion;
       current.accessibleText = suggestion;
       current.changeReason ||= "拆分长句并替换复杂表达，保留原有知识信息。";
-      current.reviewStatus = "pending";
+      applyBatchRecheck(current, draft);
     }, "生成易读版本");
   }
   if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
@@ -752,10 +974,81 @@ app.addEventListener("click", (event) => {
   if (action === "approve-all") {
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
   }
-  if (action === "export") {
-    download(`${project.title}-无障碍版.html`, exportHtml(project));
-    document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
+  if (action === "batch-center") { showBatchCenter = true; render(); }
+  if (action === "close-batch-center") { showBatchCenter = false; render(); }
+  if (action === "start-batch") {
+    commit("开始复核批次", (draft) => {
+      const label = `复核批次 ${draft.batches.length + 1}`;
+      const versionId = uid("version");
+      const batchId = uid("batch");
+      draft.versions.unshift({ id: versionId, label: `${label} 基线`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) });
+      draft.versions = draft.versions.slice(0, 10);
+      draft.batches.unshift({
+        id: batchId,
+        label,
+        status: "open",
+        startedAt: new Date().toISOString(),
+        baselineVersionId: versionId,
+        baselineBlocks: structuredClone(draft.blocks),
+        baselineIssues: analyze(draft).map((issue) => toBatchIssue(issue, draft.blocks)),
+      });
+      draft.activeBatchId = batchId;
+    });
+  }
+  if (action === "close-batch") {
+    if (project.batches.some((item) => item.id === project.activeBatchId && item.status === "open")) {
+      showBatchCenter = false;
+      closeNoteError = false;
+      showCloseBatch = true;
+      render();
+    }
+  }
+  if (action === "cancel-close-batch") { showCloseBatch = false; render(); }
+  if (action === "confirm-close-batch") {
+    const noteInput = app.querySelector<HTMLElement & { value: string }>("#close-note");
+    const note = noteInput?.value.trim() ?? "";
+    if (!note) {
+      closeNoteError = true;
+      render();
+      return;
+    }
+    closeNoteError = false;
+    showCloseBatch = false;
+    viewBatchId = project.activeBatchId ?? "";
+    commit("关闭复核批次", (draft) => {
+      const batch = draft.batches.find((item) => item.id === draft.activeBatchId && item.status === "open");
+      if (!batch) return;
+      batch.status = "closed";
+      batch.closedAt = new Date().toISOString();
+      batch.report = { ...computeBatchReport(batch, draft), note };
+      draft.activeBatchId = null;
+    });
+  }
+  if (action === "view-batch") {
+    viewBatchId = target.dataset.batchId ?? "";
+    showBatchCenter = false;
     render();
+  }
+  if (action === "close-batch-report") { viewBatchId = ""; render(); }
+  if (action === "close-export-blocked") { showExportBlocked = false; render(); }
+  if (action === "jump-block") {
+    activeBlockId = target.dataset.blockId ?? activeBlockId;
+    activeIssueId = "";
+    showExportBlocked = false;
+    render();
+    requestAnimationFrame(() => app.querySelector<HTMLElement>(".editor-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
+  if (action === "export") {
+    const errors = issues().filter((issue) => issue.severity === "error");
+    if (errors.length) {
+      showExportBlocked = true;
+      document.documentElement.dataset.lastAction = `导出被拦截：${errors.length} 个必须修复问题待处理`;
+      render();
+    } else {
+      download(`${project.title}-无障碍版.html`, exportHtml(project));
+      document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
+      render();
+    }
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
 });
@@ -765,7 +1058,7 @@ app.addEventListener("sl-change", (event) => {
   if (element.id === "chapter-file") return;
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
-    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
+    updateActiveBlock((block, draft) => { block.headingLevel = level; applyBatchRecheck(block, draft); }, "修改标题层级");
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
@@ -776,6 +1069,15 @@ app.addEventListener("sl-change", (event) => {
     const value = (element as HTMLElement & { value: string }).value;
     commit("修改术语表", (draft) => { const term = draft.glossary.find((item) => item.id === termId); if (term) term.preferred = value; });
   }
+});
+
+app.addEventListener("sl-hide", (event) => {
+  const dialog = (event.target as HTMLElement).dataset?.dialog;
+  if (dialog === "glossary") showGlossary = false;
+  if (dialog === "batch-center") showBatchCenter = false;
+  if (dialog === "close-batch") showCloseBatch = false;
+  if (dialog === "batch-report") viewBatchId = "";
+  if (dialog === "export-blocked") showExportBlocked = false;
 });
 
 app.addEventListener("change", (event) => {

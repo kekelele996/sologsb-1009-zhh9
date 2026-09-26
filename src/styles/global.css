@@ -166,6 +166,55 @@ sl-textarea::part(textarea) { line-height: 1.65; }
 ::-webkit-scrollbar-thumb { background: #b9c2bd; border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
+.batch-strip { display: flex; align-items: center; gap: 14px; padding: 7px 20px; background: #fff7e4; border-bottom: 1px solid #ecd9ae; color: #6b5a2e; font-size: 11px; }
+.batch-strip b { color: #4c3f16; }
+.batch-strip .ok { color: #2c7255; font-weight: 700; }
+.batch-strip .bad { color: #a72f27; font-weight: 700; }
+.batch-strip sl-button { margin-left: auto; }
+.batch-dot { width: 8px; height: 8px; border-radius: 50%; background: #d18a1f; box-shadow: 0 0 0 3px rgba(209, 138, 31, .22); }
+
+sl-dialog::part(panel) { width: min(680px, 94vw); }
+.dialog-lead { margin: 0 0 12px; color: #57645f; font-size: 12px; line-height: 1.6; }
+.batch-intro { border: 1px dashed #cfd8d3; border-radius: 10px; background: #f8faf8; padding: 12px; margin-bottom: 6px; }
+.batch-intro p { margin: 0 0 10px; color: #4b5a53; font-size: 11px; line-height: 1.7; }
+.batch-active-card { display: grid; gap: 8px; border: 1px solid #b9d8c8; border-radius: 10px; background: #f4faf6; padding: 12px; margin-bottom: 6px; }
+.batch-card-head { display: flex; align-items: center; gap: 8px; }
+.batch-card-head b { font-size: 13px; }
+.batch-card-head time { color: #74807a; font-size: 10px; }
+.batch-baseline { color: #57645f; font-size: 10px; }
+.batch-stats { display: flex; gap: 13px; color: #68756f; font-size: 11px; }
+.batch-stats .ok { color: #2c7255; font-weight: 700; }
+.batch-stats .bad { color: #a72f27; font-weight: 700; }
+.batch-history-title { margin: 14px 0 8px; font-size: 12px; }
+.batch-history { display: grid; gap: 7px; max-height: 260px; overflow-y: auto; }
+.batch-row { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; align-items: center; border: 1px solid #e2e7e4; border-radius: 9px; padding: 9px 11px; }
+.batch-row-main { display: flex; align-items: center; gap: 8px; }
+.batch-row-main b { font-size: 11px; }
+.batch-row-main small { color: #8a948f; font-size: 9px; }
+.batch-row-stats { color: #74807a; font-size: 10px; }
+.batch-row sl-button { grid-row: 1 / span 2; grid-column: 2; }
+.report-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-bottom: 10px; color: #68756f; font-size: 10px; }
+.report-note { border-left: 3px solid #2e785c; border-radius: 6px; background: #f2f9f5; padding: 9px 11px; margin-bottom: 12px; }
+.report-note b { color: #416354; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+.report-note p { margin: 4px 0 0; color: #33423c; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.report-section { margin-bottom: 12px; }
+.report-section h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 7px; font-size: 12px; }
+.report-section.ok h3 { color: #2c7255; }
+.report-section.bad h3 { color: #a72f27; }
+.report-section.muted h3 { color: #6d7873; }
+.report-section.left h3 { color: #8a5209; }
+.report-section ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 170px; overflow-y: auto; }
+.report-section li { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; border: 1px solid #e4e8e5; border-radius: 8px; background: #fff; padding: 7px 9px; }
+.report-section li b { display: block; font-size: 11px; }
+.report-section li small { display: block; margin-top: 1px; color: #7a8580; font-size: 9px; }
+.report-section li span { display: block; margin-top: 2px; color: #57645f; font-size: 10px; line-height: 1.5; }
+.note-error { margin-top: 6px; color: #a72f27; font-size: 11px; }
+.blocked-list { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
+.blocked-list button { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-items: center; text-align: left; border: 1px solid #efd1ce; border-left: 3px solid var(--red); border-radius: 8px; background: #fff; padding: 8px 10px; cursor: pointer; }
+.blocked-list button:hover { background: #fdf3f2; }
+.blocked-list button b { font-size: 11px; }
+.blocked-list button small { grid-column: 2; color: #74807a; font-size: 9px; }
+
 @media (max-width: 1400px) {
   .workspace { grid-template-columns: 245px minmax(520px, 1fr) 370px; }
   .online-pill { display: none; }
