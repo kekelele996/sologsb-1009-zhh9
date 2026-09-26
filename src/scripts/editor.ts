@@ -57,6 +57,7 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  reviewBatches: ReviewBatch[];
   updatedAt: string;
 }
 
@@ -68,6 +69,62 @@ interface AccessibilityIssue {
   title: string;
   detail: string;
   suggestion: string;
+}
+
+type IssueOutcome = "resolved" | "new" | "withdrawn";
+
+interface IssueSnapshot {
+  id: string;
+  blockId: string;
+  type: AccessibilityIssue["type"];
+  severity: Severity;
+  title: string;
+  detail: string;
+  suggestion: string;
+  blockLabel: string;
+}
+
+type BlockSnapshot = Pick<ContentBlock, "id" | "type" | "text" | "accessibleText" | "headingLevel" | "imageSrc" | "imageAlt" | "linkHref" | "changeReason" | "reviewStatus">;
+
+interface IssueWithdrawal {
+  issueId: string;
+  reason: string;
+  createdAt: string;
+}
+
+interface IssueDisposition {
+  issueId: string;
+  outcome: IssueOutcome;
+  title: string;
+  severity: Severity;
+  blockId: string;
+  blockLabel: string;
+  note: string;
+}
+
+interface BatchReport {
+  resolved: IssueDisposition[];
+  added: IssueDisposition[];
+  withdrawn: IssueDisposition[];
+}
+
+interface ReviewBatch {
+  id: string;
+  label: string;
+  startedAt: string;
+  reopenedAt?: string;
+  closedAt?: string;
+  closeNote?: string;
+  baseline: {
+    issues: IssueSnapshot[];
+    blocks: BlockSnapshot[];
+    versionId: string;
+    versionLabel: string;
+  };
+  /** 批次中实际改到标题层级、图片说明或链接文案、因而回到待复核的块 */
+  recheckBlockIds: string[];
+  withdrawals: IssueWithdrawal[];
+  report?: BatchReport;
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
@@ -167,6 +224,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    reviewBatches: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -299,6 +357,153 @@ function analyze(project: ChapterProject): AccessibilityIssue[] {
   return issues;
 }
 
+/**
+ * 只有标题层级、图片说明（替代文本/图注）、链接文案这三类发布前高风险字段
+ * 才会触发“回到待复核”。正文与改写原因的修改不改变签名。
+ */
+function reviewSignature(block: ContentBlock) {
+  if (block.type === "heading") return `heading:${block.headingLevel ?? 2}`;
+  if (block.type === "image") return `image:${block.imageAlt ?? ""}::${block.text}`;
+  if (block.type === "link") return `link:${block.accessibleText || block.text}`;
+  return "";
+}
+
+function snapshotBlock(block: ContentBlock): BlockSnapshot {
+  return {
+    id: block.id,
+    type: block.type,
+    text: block.text,
+    accessibleText: block.accessibleText,
+    headingLevel: block.headingLevel,
+    imageSrc: block.imageSrc,
+    imageAlt: block.imageAlt,
+    linkHref: block.linkHref,
+    changeReason: block.changeReason,
+    reviewStatus: block.reviewStatus,
+  };
+}
+
+function snapshotIssue(issue: AccessibilityIssue, blocks: ContentBlock[]): IssueSnapshot {
+  const order = blocks.findIndex((block) => block.id === issue.blockId);
+  const owner = blocks.find((block) => block.id === issue.blockId);
+  return {
+    id: issue.id,
+    blockId: issue.blockId,
+    type: issue.type,
+    severity: issue.severity,
+    title: issue.title,
+    detail: issue.detail,
+    suggestion: issue.suggestion,
+    blockLabel: `段 ${order >= 0 ? order + 1 : "?"} · ${typeLabel(owner?.type ?? "paragraph", owner?.headingLevel)}`,
+  };
+}
+
+interface BatchEvaluation {
+  resolved: IssueSnapshot[];
+  added: AccessibilityIssue[];
+  withdrawnActive: IssueWithdrawal[];
+  withdrawnMissing: IssueWithdrawal[];
+  /** 当前仍实际存在、且未被撤回的问题 */
+  remaining: AccessibilityIssue[];
+  blockingErrors: AccessibilityIssue[];
+  recheckBlocks: ContentBlock[];
+}
+
+function evaluateBatch(batch: ReviewBatch, current: ChapterProject): BatchEvaluation {
+  const currentIssues = analyze(current);
+  const currentById = new Map(currentIssues.map((issue) => [issue.id, issue]));
+  const baselineIds = new Set(batch.baseline.issues.map((issue) => issue.id));
+  const withdrawals = new Map(batch.withdrawals.map((item) => [item.issueId, item]));
+
+  const resolved: IssueSnapshot[] = [];
+  const remaining: AccessibilityIssue[] = [];
+  const withdrawnActive: IssueWithdrawal[] = [];
+  const withdrawnMissing: IssueWithdrawal[] = [];
+
+  for (const baselineIssue of batch.baseline.issues) {
+    if (!currentById.has(baselineIssue.id)) {
+      if (withdrawals.has(baselineIssue.id)) withdrawnMissing.push(withdrawals.get(baselineIssue.id)!);
+      else resolved.push(baselineIssue);
+    }
+  }
+  for (const issue of currentIssues) {
+    if (withdrawals.has(issue.id)) {
+      withdrawnActive.push(withdrawals.get(issue.id)!);
+    } else {
+      remaining.push(issue);
+    }
+  }
+  const added = currentIssues.filter((issue) => !baselineIds.has(issue.id) && !withdrawals.has(issue.id));
+  const blockingErrors = remaining.filter((issue) => issue.severity === "error");
+  const recheckBlocks = batch.recheckBlockIds
+    .map((id) => current.blocks.find((block) => block.id === id))
+    .filter((block): block is ContentBlock => Boolean(block));
+
+  return { resolved, added, withdrawnActive, withdrawnMissing, remaining, blockingErrors, recheckBlocks };
+}
+
+function dispositionNote(
+  outcome: IssueOutcome,
+  snapshot: { title: string; detail: string; suggestion: string },
+  withdrawalReason?: string,
+) {
+  if (outcome === "resolved") {
+    return `已按建议处理并通过复查：${snapshot.suggestion}`;
+  }
+  if (outcome === "withdrawn") {
+    return `复核撤回（不作为导出阻断）：${withdrawalReason || "编辑确认无需处理"}`;
+  }
+  return `复核中新出现的问题，尚待处理：${snapshot.detail}`;
+}
+
+function buildBatchReport(batch: ReviewBatch, evaluation: BatchEvaluation): BatchReport {
+  const current = project;
+  const currentById = new Map(analyze(current).map((issue) => [issue.id, issue]));
+  const indexOf = (blockId: string) => current.blocks.findIndex((block) => block.id === blockId);
+  const currentLabel = (issue: AccessibilityIssue) =>
+    `段 ${indexOf(issue.blockId) + 1} · ${blockRole(current.blocks.find((block) => block.id === issue.blockId) ?? current.blocks[0])}`;
+
+  return {
+    resolved: evaluation.resolved.map((issue) => ({
+      issueId: issue.id,
+      outcome: "resolved" as const,
+      title: issue.title,
+      severity: issue.severity,
+      blockId: issue.blockId,
+      blockLabel: issue.blockLabel,
+      note: dispositionNote("resolved", issue),
+    })),
+    added: evaluation.added.map((issue) => ({
+      issueId: issue.id,
+      outcome: "new" as const,
+      title: issue.title,
+      severity: issue.severity,
+      blockId: issue.blockId,
+      blockLabel: currentLabel(issue),
+      note: dispositionNote("new", issue),
+    })),
+    withdrawn: [...evaluation.withdrawnActive, ...evaluation.withdrawnMissing].map((withdrawal) => {
+      const baseline = batch.baseline.issues.find((issue) => issue.id === withdrawal.issueId);
+      const live = currentById.get(withdrawal.issueId);
+      const title = baseline?.title ?? live?.title ?? "已撤回的问题";
+      const severity = baseline?.severity ?? live?.severity ?? "warning";
+      const blockId = baseline?.blockId ?? live?.blockId ?? "";
+      const blockLabel = baseline?.blockLabel ?? (live ? currentLabel(live) : "（内容块已删除）");
+      const detail = baseline?.detail ?? live?.detail ?? "";
+      const suggestion = baseline?.suggestion ?? live?.suggestion ?? "";
+      return {
+        issueId: withdrawal.issueId,
+        outcome: "withdrawn" as const,
+        title,
+        severity,
+        blockId,
+        blockLabel,
+        note: dispositionNote("withdrawn", { title, detail, suggestion }, withdrawal.reason),
+      };
+    }),
+  };
+}
+
 function simplifyText(input: string, glossary: GlossaryTerm[]) {
   let result = input
     .replaceAll("由于其", "因为")
@@ -321,9 +526,13 @@ function simplifyText(input: string, glossary: GlossaryTerm[]) {
 }
 
 function blockRole(block: ContentBlock) {
-  if (block.type === "heading") return `H${block.headingLevel ?? 2} 标题`;
-  if (block.type === "image") return "图片 / 替代文本";
-  if (block.type === "link") return "链接";
+  return typeLabel(block.type, block.headingLevel);
+}
+
+function typeLabel(type: BlockType, headingLevel?: number) {
+  if (type === "heading") return `H${headingLevel ?? 2} 标题`;
+  if (type === "image") return "图片 / 替代文本";
+  if (type === "link") return "链接";
   return "正文段落";
 }
 
@@ -391,7 +600,21 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) {
+      const loaded = stored.project;
+      loaded.reviewBatches ??= [];
+      loaded.versions ??= [];
+      loaded.glossary ??= [];
+      for (const batch of loaded.reviewBatches) {
+        batch.recheckBlockIds ??= [];
+        batch.withdrawals ??= [];
+      }
+      // 若上一会话的批次没来得及关闭，保持其打开状态。
+      if (activeBatchId === "" && loaded.reviewBatches.some((batch) => !batch.closedAt)) {
+        activeBatchId = loaded.reviewBatches.find((batch) => !batch.closedAt)!.id;
+      }
+      return loaded;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -402,6 +625,7 @@ const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("Application root was not found");
 const app: HTMLDivElement = rootElement;
 
+let activeBatchId = "";
 let project = loadProject();
 let activeBlockId = project.blocks[0]?.id ?? "";
 let activeIssueId = "";
@@ -411,9 +635,23 @@ let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
+let batchDialogOpen = false;
+let withdrawIssueId = "";
+let gateOpen = false;
+let historyBatchId = "";
+let closeBatchNote = "";
+let closeBatchError = "";
+let withdrawReason = "";
+let withdrawError = "";
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+const activeBatch = () => project.reviewBatches.find((batch) => batch.id === activeBatchId && !batch.closedAt);
+
+function syncActiveBatchId() {
+  if (activeBatchId && project.reviewBatches.some((batch) => batch.id === activeBatchId && !batch.closedAt)) return;
+  activeBatchId = project.reviewBatches.find((batch) => !batch.closedAt)?.id ?? "";
+}
 
 function saveSoon() {
   window.clearTimeout(saveTimer);
@@ -440,6 +678,7 @@ function undo() {
   redoStack = [structuredClone(project), ...redoStack].slice(0, 50);
   project = previous;
   if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
+  syncActiveBatchId();
   saveSoon();
   render();
 }
@@ -449,15 +688,352 @@ function redo() {
   if (!next) return;
   undoStack = [...undoStack.slice(-49), structuredClone(project)];
   project = next;
+  syncActiveBatchId();
   saveSoon();
   render();
 }
 
-function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) => void, label = "修改无障碍文本", renderAfter = true) {
+/**
+ * @param contentEdit 是否为内容编辑。批次进行中只有签名变化（标题层级/图片说明/链接文案）
+ *                    才把内容块打回待复核；批次外保持原有行为（任何编辑都回到待审核）。
+ *                    审核状态、批注等操作传 false，绝不覆盖状态。
+ */
+function updateActiveBlock(
+  update: (block: ContentBlock, draft: ChapterProject) => void,
+  label = "修改无障碍文本",
+  renderAfter = true,
+  contentEdit = false,
+) {
+  const before = project.blocks.find((item) => item.id === activeBlockId);
+  const signatureBefore = before ? reviewSignature(before) : "";
+  const batch = activeBatch();
   commit(label, (draft) => {
     const block = draft.blocks.find((item) => item.id === activeBlockId);
     if (block) update(block, draft);
+    if (block && contentEdit) {
+      const signatureAfter = reviewSignature(block);
+      if (batch) {
+        if (signatureBefore !== signatureAfter) {
+          block.reviewStatus = "pending";
+          const draftBatch = draft.reviewBatches.find((item) => item.id === batch.id);
+          if (draftBatch && !draftBatch.recheckBlockIds.includes(block.id)) draftBatch.recheckBlockIds.push(block.id);
+        }
+      } else {
+        block.reviewStatus = "pending";
+      }
+    }
   }, renderAfter);
+}
+
+function saveVersion(draft: ChapterProject, label: string, now = new Date()) {
+  const versionId = uid("version");
+  draft.versions.unshift({
+    id: versionId,
+    label,
+    createdAt: now.toISOString(),
+    blocks: structuredClone(draft.blocks),
+    glossary: structuredClone(draft.glossary),
+  });
+  // 裁剪到 10 个版本时，进行中批次引用的基线版本不能被挤掉。
+  const protectedIds = new Set(
+    draft.reviewBatches.filter((batch) => !batch.closedAt).map((batch) => batch.baseline.versionId),
+  );
+  const kept: VersionSnapshot[] = [];
+  for (const item of draft.versions) {
+    if (kept.length < 10 || protectedIds.has(item.id)) kept.push(item);
+  }
+  draft.versions = kept;
+  return versionId;
+}
+
+function startBatch() {
+  if (activeBatch() || project.reviewBatches.some((batch) => !batch.closedAt)) return;
+  const now = new Date();
+  const label = `发布复核 ${now.getMonth() + 1}月${now.getDate()}日 ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  const versionLabel = `复核基线 · ${label}`;
+  const snapshot = structuredClone(project);
+  const baselineIssues = analyze(snapshot).map((issue) => snapshotIssue(issue, snapshot.blocks));
+  let versionId = "";
+  let batchId = "";
+  commit("开始发布复核批次", (draft) => {
+    versionId = saveVersion(draft, versionLabel, now);
+    batchId = uid("batch");
+    draft.reviewBatches.unshift({
+      id: batchId,
+      label,
+      startedAt: now.toISOString(),
+      baseline: {
+        issues: baselineIssues,
+        blocks: draft.blocks.map(snapshotBlock),
+        versionId,
+        versionLabel,
+      },
+      recheckBlockIds: [],
+      withdrawals: [],
+    });
+    draft.reviewBatches = draft.reviewBatches.slice(0, 20);
+  });
+  activeBatchId = batchId;
+  selectedVersionId = versionId;
+  historyBatchId = "";
+  batchDialogOpen = true;
+  closeBatchNote = "";
+  closeBatchError = "";
+  render();
+}
+
+function closeBatch() {
+  const batch = activeBatch();
+  if (!batch) return;
+  const note = closeBatchNote.trim();
+  if (!note) {
+    closeBatchError = "请先填写本轮发布复核的处理说明。";
+    render();
+    return;
+  }
+  const evaluation = evaluateBatch(batch, project);
+  const report = buildBatchReport(batch, evaluation);
+  if (evaluation.blockingErrors.length) {
+    closeBatchError = `仍有 ${evaluation.blockingErrors.length} 个必须修复的问题未处理，导出会被拦截；请先修复，或在问题列表中逐条说明撤回理由。`;
+    render();
+    return;
+  }
+  commit("关闭发布复核批次", (draft) => {
+    const target = draft.reviewBatches.find((item) => item.id === batch.id);
+    if (!target) return;
+    target.closedAt = new Date().toISOString();
+    target.closeNote = note;
+    target.report = report;
+  });
+  activeBatchId = "";
+  closeBatchError = "";
+  closeBatchNote = "";
+  historyBatchId = batch.id;
+  batchDialogOpen = true;
+  render();
+}
+
+function reopenBatch(batchId: string) {
+  if (project.reviewBatches.some((batch) => !batch.closedAt)) return;
+  commit("重新打开发布复核批次", (draft) => {
+    const target = draft.reviewBatches.find((item) => item.id === batchId);
+    if (!target || !target.closedAt) return;
+    target.reopenedAt = new Date().toISOString();
+    target.closedAt = undefined;
+    target.closeNote = undefined;
+    target.report = undefined;
+  });
+  activeBatchId = batchId;
+  closeBatchError = "";
+  closeBatchNote = "";
+  render();
+}
+
+function confirmWithdrawIssue() {
+  const batch = activeBatch();
+  if (!batch || !withdrawIssueId) return;
+  const reason = withdrawReason.trim();
+  if (reason.length < 2) {
+    withdrawError = "请填写撤回理由（至少 2 个字），关闭批次时会一并记录。";
+    render();
+    return;
+  }
+  const issueId = withdrawIssueId;
+  commit("撤回问题", (draft) => {
+    const target = draft.reviewBatches.find((item) => item.id === batch.id);
+    if (!target) return;
+    target.withdrawals = target.withdrawals.filter((item) => item.issueId !== issueId);
+    target.withdrawals.push({ issueId, reason, createdAt: new Date().toISOString() });
+  });
+  withdrawIssueId = "";
+  withdrawReason = "";
+  withdrawError = "";
+  render();
+}
+
+function tryExport() {
+  const batch = activeBatch();
+  const currentErrors = issues().filter((issue) => issue.severity === "error");
+  const withdrawnIds = new Set((batch?.withdrawals ?? []).map((item) => item.issueId));
+  const blockingErrors = currentErrors.filter((issue) => !withdrawnIds.has(issue.id));
+  if (blockingErrors.length) {
+    gateOpen = true;
+    render();
+    return;
+  }
+  download(`${project.title}-无障碍版.html`, exportHtml(project));
+  document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
+  render();
+}
+
+function outcomeLabel(outcome: IssueOutcome) {
+  if (outcome === "resolved") return "已解决";
+  if (outcome === "new") return "新增";
+  return "已撤回";
+}
+
+function renderDispositionList(items: IssueDisposition[], emptyText: string) {
+  if (!items.length) return `<div class="empty-note">${emptyText}</div>`;
+  return `<div class="disposition-list">${items.map((item) => `
+    <div class="disposition ${item.outcome}">
+      <div><span class="outcome-tag ${item.outcome}">${outcomeLabel(item.outcome)}</span><sl-badge variant="${item.severity === "error" ? "danger" : item.severity === "warning" ? "warning" : "primary"}">${severityLabel(item.severity)}</sl-badge><b>${escapeHtml(item.title)}</b><span class="block-label">${escapeHtml(item.blockLabel)}</span></div>
+      <p>${escapeHtml(item.note)}</p>
+    </div>`).join("")}</div>`;
+}
+
+function renderOpenBatch(batch: ReviewBatch) {
+  const evaluation = evaluateBatch(batch, project);
+  const remainingById = new Map(evaluation.remaining.map((issue) => [issue.id, issue]));
+  const withdrawnSet = new Set(batch.withdrawals.map((item) => item.issueId));
+  const baselineRows = batch.baseline.issues.map((issue) => {
+    const status = withdrawnSet.has(issue.id)
+      ? `<span class="outcome-tag withdrawn">已撤回</span>`
+      : remainingById.has(issue.id)
+        ? `<span class="outcome-tag new">未解决</span>`
+        : `<span class="outcome-tag resolved">已解决</span>`;
+    return `<div class="baseline-issue">${status}<div><b>${escapeHtml(issue.title)}</b><small>${escapeHtml(issue.blockLabel)} · ${escapeHtml(issue.detail)}</small></div></div>`;
+  }).join("") || `<div class="empty-note">基线中没有问题。</div>`;
+  const recheckRows = evaluation.recheckBlocks.map((block) => {
+    const order = project.blocks.findIndex((item) => item.id === block.id) + 1;
+    return `<div class="recheck-row"><b>${order} · ${blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span><i class="status-${block.reviewStatus}">${statusLabel(block.reviewStatus)}</i><sl-button size="small" variant="default" data-action="select-block" data-block-id="${block.id}">定位</sl-button></div>`;
+  }).join("") || `<div class="empty-note">还没有块因为修改标题层级、图片说明或链接文案而回到待复核。</div>`;
+  const withdrawalRows = batch.withdrawals.map((item) => {
+    const baseline = batch.baseline.issues.find((issue) => issue.id === item.issueId);
+    const live = issues().find((issue) => issue.id === item.issueId);
+    return `<div class="disposition withdrawn"><div><b>${escapeHtml(baseline?.title ?? live?.title ?? item.issueId)}</b></div><p>撤回理由：${escapeHtml(item.reason)}</p><small>${new Date(item.createdAt).toLocaleString()}</small></div>`;
+  }).join("") || `<div class="empty-note">没有撤回记录。</div>`;
+  const addedRows = evaluation.added.map((issue) => {
+    const order = project.blocks.findIndex((block) => block.id === issue.blockId) + 1;
+    return `<div class="baseline-issue"><span class="outcome-tag new">新增</span><div><b>${escapeHtml(issue.title)}</b><small>段 ${order} · ${escapeHtml(issue.detail)}</small><sl-button size="small" variant="default" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}">定位</sl-button></div></div>`;
+  }).join("") || `<div class="empty-note">本轮没有引入新问题。</div>`;
+
+  return `<div class="batch-body">
+    <div class="batch-meta">
+      <div><b>${escapeHtml(batch.label)}</b><small>开始于 ${new Date(batch.startedAt).toLocaleString()}${batch.reopenedAt ? ` · 曾于 ${new Date(batch.reopenedAt).toLocaleString()} 重新打开` : ""}</small></div>
+      <div class="batch-chips">
+        <sl-badge variant="neutral">基线问题 ${batch.baseline.issues.length}</sl-badge>
+        <sl-badge variant="neutral">基线内容块 ${batch.baseline.blocks.length}</sl-badge>
+        <sl-badge variant="success">已解决 ${evaluation.resolved.length}</sl-badge>
+        <sl-badge variant="warning">新增 ${evaluation.added.length}</sl-badge>
+        <sl-badge variant="neutral">撤回 ${batch.withdrawals.length}</sl-badge>
+        <sl-badge variant="danger">必修未清 ${evaluation.blockingErrors.length}</sl-badge>
+      </div>
+      <small class="baseline-version">对照基线版本：${escapeHtml(batch.baseline.versionLabel)}（可在右侧“版本比较”中查看）</small>
+    </div>
+    <section class="batch-section"><h3>回到待复核的内容块（${evaluation.recheckBlocks.length}）</h3><p class="section-hint">只有实际改到标题层级、图片说明或链接文案的块才会回到待复核。</p><div class="recheck-list">${recheckRows}</div></section>
+    <section class="batch-section"><h3>基线问题处理情况（${batch.baseline.issues.length}）</h3><div class="baseline-list">${baselineRows}</div></section>
+    <section class="batch-section"><h3>本轮新增问题（${evaluation.added.length}）</h3><div class="baseline-list">${addedRows}</div></section>
+    <section class="batch-section"><h3>撤回记录（${batch.withdrawals.length}）</h3><div class="disposition-list">${withdrawalRows}</div></section>
+    <section class="batch-close">
+      <label class="field-label" for="close-note">关闭批次处理说明（必填）</label>
+      <sl-textarea id="close-note" rows="3" value="${escapeHtml(closeBatchNote)}" placeholder="说明本轮复核范围、主要修复内容、撤回问题的依据，以及遗留风险。"></sl-textarea>
+      ${closeBatchError ? `<div class="form-error">${escapeHtml(closeBatchError)}</div>` : ""}
+      <sl-button variant="warning" data-action="close-batch">关闭批次并生成报告</sl-button>
+    </section>
+  </div>`;
+}
+
+function renderClosedBatch(batch: ReviewBatch) {
+  const report = batch.report ?? { resolved: [], added: [], withdrawn: [] };
+  const anotherOpen = Boolean(activeBatch());
+  return `<div class="batch-body">
+    <div class="batch-meta">
+      <div><b>${escapeHtml(batch.label)}</b><small>${new Date(batch.startedAt).toLocaleString()} 开始 · ${batch.closedAt ? new Date(batch.closedAt).toLocaleString() : ""} 关闭${batch.reopenedAt ? ` · ${new Date(batch.reopenedAt).toLocaleString()} 重新打开后复查` : ""}</small></div>
+      <div class="batch-chips">
+        <sl-badge variant="success">已解决 ${report.resolved.length}</sl-badge>
+        <sl-badge variant="warning">新增 ${report.added.length}</sl-badge>
+        <sl-badge variant="neutral">撤回 ${report.withdrawn.length}</sl-badge>
+      </div>
+      <small class="baseline-version">基线版本：${escapeHtml(batch.baseline.versionLabel)}</small>
+    </div>
+    <section class="batch-section"><h3>关闭时处理说明</h3><div class="close-note-box">${escapeHtml(batch.closeNote ?? "")}</div></section>
+    <section class="batch-section"><h3>已解决问题（${report.resolved.length}）</h3>${renderDispositionList(report.resolved, "无")}</section>
+    <section class="batch-section"><h3>新增问题（${report.added.length}）</h3>${renderDispositionList(report.added, "无")}</section>
+    <section class="batch-section"><h3>撤回问题（${report.withdrawn.length}）</h3>${renderDispositionList(report.withdrawn, "无")}</section>
+    <div class="batch-footer-actions">
+      <sl-button variant="default" data-action="batch-history-list">返回批次历史</sl-button>
+      <sl-button variant="primary" data-action="reopen-batch" data-batch-id="${batch.id}" ${anotherOpen ? "disabled" : ""}>${anotherOpen ? "有批次进行中，暂不能重开" : "重新打开此批次继续复核"}</sl-button>
+    </div>
+  </div>`;
+}
+
+function renderBatchHistoryList() {
+  const closed = project.reviewBatches.filter((batch) => batch.closedAt);
+  if (!closed.length) {
+    return `<div class="batch-body">
+      <div class="batch-start-card">
+        <h3>还没有发布复核批次</h3>
+        <p>开始批次时会冻结当前问题、内容块快照，并保存一个“复核基线”版本。批次进行中，只有改到标题层级、图片说明或链接文案的内容块会回到待复核；关闭时会对照基线列出已解决、新增和撤回的问题。仍有“必须修复”问题时，导出入口会拦截。</p>
+        <sl-button variant="primary" data-action="start-batch">开始发布复核批次</sl-button>
+      </div>
+    </div>`;
+  }
+  return `<div class="batch-body">
+    <div class="history-list">${closed.map((batch) => {
+      const report = batch.report ?? { resolved: [], added: [], withdrawn: [] };
+      return `<div class="history-item">
+        <div><b>${escapeHtml(batch.label)}</b><small>${new Date(batch.startedAt).toLocaleString()} → ${batch.closedAt ? new Date(batch.closedAt).toLocaleString() : ""}</small></div>
+        <div class="history-counts"><span class="resolved">已解决 ${report.resolved.length}</span><span class="new">新增 ${report.added.length}</span><span class="withdrawn">撤回 ${report.withdrawn.length}</span></div>
+        <sl-button size="small" variant="default" data-action="view-history-batch" data-batch-id="${batch.id}">查看 / 重新打开</sl-button>
+      </div>`;
+    }).join("")}</div>
+  </div>`;
+}
+
+function renderBatchDialogs() {
+  const batch = activeBatch();
+  let dialogLabel = "发布复核批次";
+  let body: string;
+  if (batch) {
+    dialogLabel = `发布复核批次 · ${batch.label}`;
+    body = renderOpenBatch(batch);
+  } else if (historyBatchId) {
+    const historyBatch = project.reviewBatches.find((item) => item.id === historyBatchId);
+    body = historyBatch && historyBatch.closedAt
+      ? renderClosedBatch(historyBatch)
+      : renderBatchHistoryList();
+  } else {
+    body = renderBatchHistoryList();
+  }
+  return `<sl-dialog label="${escapeHtml(dialogLabel)}" ${batchDialogOpen ? "open" : ""} data-dialog="batch" class="batch-dialog">${body}
+    <sl-button slot="footer" variant="default" data-action="close-batch-dialog">${batch ? "收起（批次继续进行）" : "关闭"}</sl-button>
+    ${batch ? `<sl-button slot="footer" variant="warning" data-action="close-batch">关闭批次并生成报告</sl-button>` : `<sl-button slot="footer" variant="primary" data-action="start-batch">开始发布复核批次</sl-button>`}
+  </sl-dialog>`;
+}
+
+function renderWithdrawDialog() {
+  if (!withdrawIssueId) return "";
+  const batch = activeBatch();
+  const issue = issues().find((item) => item.id === withdrawIssueId)
+    ?? batch?.baseline.issues.find((item) => item.id === withdrawIssueId);
+  if (!batch || !issue) return "";
+  return `<sl-dialog label="撤回问题" open data-dialog="withdraw" class="small-dialog">
+    <p class="withdraw-target"><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><b>${escapeHtml(issue.title)}</b></p>
+    <p class="section-hint">撤回后该问题不再阻断导出，撤回理由会写入批次关闭报告。请确认不是必须修复的无障碍缺陷。</p>
+    <sl-textarea id="withdraw-reason" rows="3" value="${escapeHtml(withdrawReason)}" placeholder="例如：该图为纯装饰图，已用空替代文本处理；检查规则误报。"></sl-textarea>
+    ${withdrawError ? `<div class="form-error">${escapeHtml(withdrawError)}</div>` : ""}
+    <sl-button slot="footer" variant="default" data-action="cancel-withdraw">取消</sl-button>
+    <sl-button slot="footer" variant="primary" data-action="confirm-withdraw">确认撤回</sl-button>
+  </sl-dialog>`;
+}
+
+function renderGateDialog() {
+  if (!gateOpen) return "";
+  const batch = activeBatch();
+  const withdrawnSet = new Set((batch?.withdrawals ?? []).map((item) => item.issueId));
+  const blocking = issues().filter((issue) => issue.severity === "error" && !withdrawnSet.has(issue.id));
+  return `<sl-dialog label="导出被拦截：仍有必须修复的问题" open data-dialog="gate" class="gate-dialog">
+    <p class="section-hint">${batch ? `批次「${escapeHtml(batch.label)}」尚未清零。` : ""}以下 ${blocking.length} 个问题会影响读屏用户使用，必须修复后才能导出；如确属误报，可${batch ? "在问题列表中说明理由后撤回" : "先开始发布复核批次再撤回"}。</p>
+    <div class="gate-list">${blocking.map((issue) => {
+      const order = project.blocks.findIndex((block) => block.id === issue.blockId) + 1;
+      const block = project.blocks.find((item) => item.id === issue.blockId);
+      return `<div class="gate-item">
+        <div><b>${escapeHtml(issue.title)}</b><small>段 ${order} · ${block ? escapeHtml(blockRole(block)) : ""} · ${escapeHtml(issue.detail)}</small></div>
+        <sl-button size="small" variant="default" data-action="gate-jump" data-issue-id="${issue.id}" data-block-id="${issue.blockId}">定位块</sl-button>
+      </div>`;
+    }).join("")}</div>
+    <sl-button slot="footer" variant="primary" data-action="close-gate">去处理</sl-button>
+  </sl-dialog>`;
 }
 
 function render() {
@@ -466,6 +1042,11 @@ function render() {
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+
+  const batch = activeBatch();
+  const batchEvaluation = batch ? evaluateBatch(batch, project) : null;
+  const withdrawnIds = new Set((batch?.withdrawals ?? []).map((item) => item.issueId));
+  const visibleErrors = list.filter((issue) => issue.severity === "error" && !withdrawnIds.has(issue.id));
 
   app.innerHTML = `
     <div class="app-shell">
@@ -480,7 +1061,8 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
-          <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
+          <sl-button size="small" variant="default" data-action="save-version">保存版本</sl-button>
+          <sl-button size="small" variant="${batch ? "warning" : "default"}" data-action="open-batch">${batch ? `复核进行中 · ${batchEvaluation?.blockingErrors.length ?? 0} 必修` : "发布复核批次"}</sl-button>
           <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
         </div>
       </header>
@@ -489,11 +1071,18 @@ function render() {
         <div class="progress-copy"><b>${approved}/${project.blocks.length}</b><span>内容块已审核通过</span></div>
         <div class="progress-bar"><i style="width:${Math.round((approved / Math.max(1, project.blocks.length)) * 100)}%"></i></div>
         <div class="issue-counts">
-          <span class="error">${list.filter((issue) => issue.severity === "error").length} 必须修复</span>
+          <span class="error">${visibleErrors.length} 必须修复</span>
           <span class="warning">${list.filter((issue) => issue.severity === "warning").length} 建议优化</span>
           <span class="info">${list.filter((issue) => issue.severity === "info").length} 术语提醒</span>
         </div>
       </div>
+
+      ${batch && batchEvaluation ? `<div class="batch-strip">
+        <span class="batch-dot"></span>
+        <b>${escapeHtml(batch.label)}</b>
+        <span>复核进行中：基线 ${batch.baseline.issues.length} 个问题 · 已解决 ${batchEvaluation.resolved.length} · 新增 ${batchEvaluation.added.length} · 撤回 ${batch.withdrawals.length} · 回到待复核 ${batchEvaluation.recheckBlocks.length} 块</span>
+        <sl-button size="small" variant="warning" outline data-action="open-batch">打开复核批次</sl-button>
+      </div>` : ""}
 
       <div class="workspace">
         <aside class="outline-panel">
@@ -501,10 +1090,12 @@ function render() {
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
-              return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
+              const inRecheck = batch?.recheckBlockIds.includes(block.id) ?? false;
+              return `<button class="block-item ${block.id === active.id ? "active" : ""} ${inRecheck ? "recheck" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
+                ${inRecheck ? `<span class="recheck-badge" title="本轮复核中修改了标题层级、图片说明或链接文案，需重新复核">复核</span>` : ""}
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
@@ -524,8 +1115,8 @@ function render() {
           </div>
 
           ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
-            <div class="issue-card ${issue.severity}">
-              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong></div>
+            <div class="issue-card ${issue.severity} ${withdrawnIds.has(issue.id) ? "withdrawn" : ""}">
+              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong>${withdrawnIds.has(issue.id) ? `<sl-badge variant="neutral">已撤回</sl-badge>` : ""}</div>
               <p>${escapeHtml(issue.detail)}</p><small>${escapeHtml(issue.suggestion)}</small>
             </div>`).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
 
@@ -575,7 +1166,21 @@ function render() {
           <section class="issues-panel">
             <div class="section-heading"><div><span class="eyebrow">All checks</span><h2>全章问题</h2></div><sl-button size="small" variant="default" outline data-action="approve-all">全部通过</sl-button></div>
             <div class="issue-list">
-              ${list.length ? list.map((issue) => `<button class="${issue.id === activeIssueId ? "active" : ""} ${issue.severity}" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}"><span>${severityLabel(issue.severity)}</span><b>${escapeHtml(issue.title)}</b><small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1} · ${escapeHtml(issue.suggestion)}</small></button>`).join("") : `<div class="issue-clear">✓ 全章检查通过</div>`}
+              ${list.length ? list.map((issue) => {
+                const withdrawn = withdrawnIds.has(issue.id);
+                const reason = batch?.withdrawals.find((item) => item.issueId === issue.id)?.reason ?? "";
+                return `<div class="issue-row ${issue.severity} ${issue.id === activeIssueId ? "active" : ""} ${withdrawn ? "withdrawn" : ""}">
+                  <button data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}">
+                    <span>${severityLabel(issue.severity)}${withdrawn ? " · 已撤回" : ""}</span>
+                    <b>${escapeHtml(issue.title)}</b>
+                    <small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1} · ${escapeHtml(issue.suggestion)}</small>
+                    ${withdrawn ? `<small class="withdraw-note">撤回理由：${escapeHtml(reason)}</small>` : ""}
+                  </button>
+                  ${batch ? (withdrawn
+                    ? `<sl-button size="small" variant="text" data-action="restore-issue" data-issue-id="${issue.id}">恢复</sl-button>`
+                    : `<sl-button size="small" variant="text" data-action="ask-withdraw" data-issue-id="${issue.id}">撤回</sl-button>`) : ""}
+                </div>`;
+              }).join("") : `<div class="issue-clear">✓ 全章检查通过</div>`}
             </div>
           </section>
 
@@ -598,7 +1203,10 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
-    </sl-dialog>`;
+    </sl-dialog>
+    ${renderBatchDialogs()}
+    ${renderWithdrawDialog()}
+    ${renderGateDialog()}`;
 
   wireLiveFields();
 }
@@ -665,8 +1273,7 @@ function wireLiveFields() {
         }
         if (field === "link-href") block.linkHref = value;
         if (field === "reason") block.changeReason = value;
-        block.reviewStatus = "pending";
-      }, "编辑无障碍文本", false);
+      }, "编辑无障碍文本", false, true);
     });
     element.addEventListener("sl-change", () => render());
   });
@@ -698,8 +1305,7 @@ app.addEventListener("click", (event) => {
       if (current.type === "image") current.imageAlt = suggestion;
       current.accessibleText = suggestion;
       current.changeReason ||= "拆分长句并替换复杂表达，保留原有知识信息。";
-      current.reviewStatus = "pending";
-    }, "生成易读版本");
+    }, "生成易读版本", true, true);
   }
   if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
   if (action === "needs-work") updateActiveBlock((block) => { block.reviewStatus = "needs-work"; }, "标记需修改");
@@ -741,10 +1347,9 @@ app.addEventListener("click", (event) => {
     commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
   }
   if (action === "save-version") {
-    const versionId = uid("version");
+    let versionId = "";
     commit("保存版本快照", (draft) => {
-      draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) });
-      draft.versions = draft.versions.slice(0, 10);
+      versionId = saveVersion(draft, `版本 ${draft.versions.length + 1}`);
     });
     selectedVersionId = versionId;
     render();
@@ -753,11 +1358,44 @@ app.addEventListener("click", (event) => {
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
   }
   if (action === "export") {
-    download(`${project.title}-无障碍版.html`, exportHtml(project));
-    document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
-    render();
+    tryExport();
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
+  if (action === "open-batch") {
+    historyBatchId = "";
+    batchDialogOpen = true;
+    render();
+  }
+  if (action === "start-batch") startBatch();
+  if (action === "close-batch") closeBatch();
+  if (action === "close-batch-dialog") { batchDialogOpen = false; render(); }
+  if (action === "reopen-batch") reopenBatch(target.dataset.batchId ?? "");
+  if (action === "view-history-batch") { historyBatchId = target.dataset.batchId ?? ""; batchDialogOpen = true; render(); }
+  if (action === "batch-history-list") { historyBatchId = ""; render(); }
+  if (action === "ask-withdraw") {
+    withdrawIssueId = target.dataset.issueId ?? "";
+    withdrawReason = "";
+    withdrawError = "";
+    render();
+  }
+  if (action === "cancel-withdraw") { withdrawIssueId = ""; withdrawError = ""; render(); }
+  if (action === "confirm-withdraw") confirmWithdrawIssue();
+  if (action === "restore-issue") {
+    const batch = activeBatch();
+    const issueId = target.dataset.issueId ?? "";
+    if (batch) commit("恢复问题", (draft) => {
+      const targetBatch = draft.reviewBatches.find((item) => item.id === batch.id);
+      if (targetBatch) targetBatch.withdrawals = targetBatch.withdrawals.filter((item) => item.issueId !== issueId);
+    });
+  }
+  if (action === "close-gate") { gateOpen = false; render(); }
+  if (action === "gate-jump") {
+    gateOpen = false;
+    activeIssueId = target.dataset.issueId ?? "";
+    activeBlockId = target.dataset.blockId ?? activeBlockId;
+    render();
+    requestAnimationFrame(() => app.querySelector<HTMLElement>(".editor-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
 });
 
 app.addEventListener("sl-change", (event) => {
@@ -765,7 +1403,7 @@ app.addEventListener("sl-change", (event) => {
   if (element.id === "chapter-file") return;
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
-    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
+    updateActiveBlock((block) => { block.headingLevel = level; }, "修改标题层级", true, true);
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
@@ -798,6 +1436,28 @@ app.addEventListener("input", (event) => {
   }
 });
 
+app.addEventListener("sl-input", (event) => {
+  const element = event.target as HTMLElement & { value: string };
+  if (element.id === "close-note") {
+    closeBatchNote = element.value;
+    closeBatchError = "";
+  }
+  if (element.id === "withdraw-reason") {
+    withdrawReason = element.value;
+    withdrawError = "";
+  }
+});
+
+app.addEventListener("sl-hide", (event) => {
+  const element = event.target as HTMLElement;
+  const dialogName = element.dataset.dialog;
+  if (!dialogName) return;
+  if (dialogName === "batch") batchDialogOpen = false;
+  if (dialogName === "withdraw") { withdrawIssueId = ""; withdrawError = ""; }
+  if (dialogName === "gate") gateOpen = false;
+  if (dialogName === "glossary") showGlossary = false;
+});
+
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
 window.addEventListener("keydown", (event) => {
@@ -811,8 +1471,8 @@ window.addEventListener("keydown", (event) => {
   }
   if (command && event.key.toLowerCase() === "s") {
     event.preventDefault();
-    const versionId = uid("version");
-    commit("键盘保存版本", (draft) => { draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) }); });
+    let versionId = "";
+    commit("键盘保存版本", (draft) => { versionId = saveVersion(draft, `版本 ${draft.versions.length + 1}`); });
     selectedVersionId = versionId;
     return;
   }
